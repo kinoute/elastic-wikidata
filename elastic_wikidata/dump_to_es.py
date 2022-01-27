@@ -1,8 +1,9 @@
 import json
 from itertools import islice
 from tqdm.auto import tqdm
+import pandas as pd
 from elasticsearch import Elasticsearch
-from elasticsearch.helpers import streaming_bulk
+from elasticsearch.helpers import parallel_bulk
 from typing import Union
 from elastic_wikidata.wd_entities import (
     get_entities,
@@ -87,23 +88,21 @@ class processDump:
                     self.es_credentials["ELASTICSEARCH_USER"],
                     self.es_credentials["ELASTICSEARCH_PASSWORD"],
                 ),
-                max_retries=100,
-                retry_on_timeout=True,
             )
         else:
             # run on localhost
             print("Connecting to Elasticsearch on localhost")
-            self.es = Elasticsearch(
-                max_retries=100,
-                retry_on_timeout=True,
-            )
+            self.es = Elasticsearch()
 
         mappings = {
+            ################
+            # A AMELIORER
             "mappings": {
                 "properties": {
-                    "labels": {"type": "text", "copy_to": "labels_aliases"},
-                    "aliases": {"type": "text", "copy_to": "labels_aliases"},
-                    "labels_aliases": {"type": "text", "store": "true"},
+                    "labels": {"type": "text"},
+                    "aliases": {"type": "text"},
+                    "id": {"type": "keyword"},
+                    "rank": {"type": "integer"},
                 }
             }
         }
@@ -114,7 +113,7 @@ class processDump:
             print(
                 "Temporary disabling refresh for the index. Will reset refresh interval to the default (1s) after load is complete."
             )
-            self.es.indices.put_settings({"index": {"refresh_interval": -1}})
+            self.es.indices.put_settings({"index": {"refresh_interval": "1s"}})
 
     def dump_to_es(self):
         print("Indexing documents...")
@@ -127,27 +126,24 @@ class processDump:
         elif self.entities:
             action_generator = self.generate_actions_from_entities()
 
-        try:
-            for ok, action in tqdm(
-                streaming_bulk(
-                    client=self.es,
-                    index=self.index_name,
-                    actions=action_generator,
-                    chunk_size=self.config["chunk_size"],
-                    # queue_size=self.config["queue_size"],
-                    max_retries=3,
-                ),
-            ):
-                if not ok:
-                    print(action)
-                    errors.append(action)
-                successes += ok
+        for ok, action in tqdm(
+            parallel_bulk(
+                client=self.es,
+                index=self.index_name,
+                actions=action_generator,
+                chunk_size=self.config["chunk_size"],
+                queue_size=self.config["queue_size"],
+            ),
+        ):
+            if not ok:
+                print(action)
+                errors.append(action)
+            successes += ok
 
-        finally:
-            if self.disable_refresh_on_index:
-                # reset back to default
-                print("Refresh interval set back to default of 1s.")
-                self.es.indices.put_settings({"index": {"refresh_interval": "1s"}})
+        if self.disable_refresh_on_index:
+            # reset back to default
+            print("Refresh interval set back to default of 1s.")
+            self.es.indices.put_settings({"index": {"refresh_interval": "1s"}})
 
     def process_doc(self, doc: dict) -> dict:
         """
@@ -164,8 +160,12 @@ class processDump:
         Generator to yield a processed document from the Wikidata JSON dump.
         Each line of the Wikidata JSON dump is a separate document.
         """
+        print(0)
         with open(self.dump_path, "r", encoding="utf-8") as f:
             objects = (json.loads(line) for line in f)
+            # This CSV file can be download here:
+            # https://qrank.wmcloud.org/download/qrank.csv.gz
+            df_rank = pd.read_csv("qrank.csv").set_index("Entity", drop=True)
 
             # optionally limit number that are loaded
             if self.doc_limit is not None:
@@ -173,8 +173,14 @@ class processDump:
 
             for item in objects:
                 doc = self.process_doc(item)
+                try:
+                    rank = df_rank.loc[doc["id"]]["QRank"]
+                except:
+                    rank = 0
 
-                yield doc
+                doc.update({"rank": rank})
+
+                yield {"_index": self.index_name, "_id": doc["id"], "_source": doc}
 
     def generate_actions_from_entities(self):
         """
